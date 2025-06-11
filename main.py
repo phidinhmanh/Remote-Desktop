@@ -12,6 +12,7 @@ from pynput import mouse, keyboard
 import base64
 import struct
 from datetime import datetime
+import os
 
 
 class KeyboardHandler:
@@ -701,6 +702,7 @@ class HostApp:
         title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
 
         # Thông tin kết nối
+        #
         connection_frame = ttk.LabelFrame(main_frame, text="Connection Settings", padding="10")
         connection_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
 
