@@ -562,7 +562,7 @@ class SocketConnection:
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((host, port))
+            threading.Thread(target=self.socket.bind, args=((host, port),)).start()
             self.socket.listen(1)
             print(f"Server started on {host}:{port}")
 
@@ -579,7 +579,9 @@ class SocketConnection:
             self.receive_thread.start()
 
             return True
-        except Exception as e:
+        except ConnectionAbortedError as e:
+            import sys
+            sys.exit(1)
             print(f"Server start error: {e}")
             return False
 
@@ -587,7 +589,8 @@ class SocketConnection:
         """Kết nối đến server"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((host, port))
+
+            threading.Thread(target=self.socket.connect, args=((host, port),)).start()
             self.is_connected = True
             print(f"Connected to server {host}:{port}")
 
@@ -597,7 +600,7 @@ class SocketConnection:
             self.receive_thread.start()
 
             return True
-        except Exception as e:
+        except ConnectionRefusedError as e:
             print(f"Connection error: {e}")
             return False
 
@@ -674,14 +677,14 @@ class SocketConnection:
 class ScreenAdapter:
     """Lớp điều chỉnh, quản lý và HIỂN THỊ dữ liệu màn hình lên Canvas."""
 
-    def __init__(self, canvas):
+    def __init__(self, canvas, screen_width, screen_height):
         """
         Khởi tạo với một tham chiếu đến tk.Canvas để vẽ lên.
         canvas: Đối tượng tk.Canvas từ ClientApp.
         """
         self.canvas = canvas
-        self.screen_width = None
-        self.screen_height = None
+        self.screen_width = screen_width
+        self.screen_height = screen_height
         self.current_image = None  # Lưu trữ hình ảnh PIL
         self.tk_image = None       # Lưu trữ hình ảnh ImageTk để hiển thị (QUAN TRỌNG)
 
@@ -751,7 +754,6 @@ class HostApp:
         self.message_control = MessageControl()
         self.chat_window = None
         # ScreenAdapter không thực sự cần thiết ở Host, nhưng giữ lại nếu có logic khác cần
-        self.screen_adapter = ScreenAdapter(None) 
 
         self.is_sharing = False
         self.message_control.set_user_name("Host")
@@ -925,9 +927,9 @@ class ClientApp:
         self.mouse_handler = MouseHandler()       # Vẫn cần cho logic gửi đi
         self.message_control = MessageControl()
         self.chat_window = None
-        
+
         # Sẽ được khởi tạo trong setup_ui sau khi canvas được tạo
-        self.screen_adapter = None 
+        self.screen_adapter = None
         self.canvas = None
 
         self.is_connected = False
@@ -939,7 +941,7 @@ class ClientApp:
         """Thiết lập giao diện"""
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+
         # ... (Phần control_frame không thay đổi) ...
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -962,7 +964,7 @@ class ClientApp:
         self.status_var = tk.StringVar(value="Disconnected")
         status_label = ttk.Label(control_frame, textvariable=self.status_var)
         status_label.pack(side=tk.RIGHT)
-        
+
         screen_frame = ttk.LabelFrame(main_frame, text="Remote Screen", padding="5")
         screen_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         canvas_frame = ttk.Frame(screen_frame)
@@ -981,7 +983,7 @@ class ClientApp:
         canvas_frame.rowconfigure(0, weight=1)
 
         # (SỬA LẠI) Khởi tạo ScreenAdapter VỚI canvas
-        self.screen_adapter = ScreenAdapter(self.canvas)
+        self.screen_adapter = ScreenAdapter(self.canvas, 1080, 1920)
 
         # Bind events (giữ nguyên)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
@@ -991,7 +993,7 @@ class ClientApp:
         self.canvas.focus_set()
         self.canvas.bind("<KeyPress>", self.on_canvas_key)
         self.canvas.bind("<KeyRelease>", self.on_canvas_key)
-        
+
         # ... (Phần cấu hình grid weights không thay đổi) ...
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
