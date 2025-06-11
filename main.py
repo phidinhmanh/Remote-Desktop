@@ -671,180 +671,249 @@ class SocketConnection:
         if self.socket:
             self.socket.close()
 
+class ScreenAdapter:
+    """Lớp điều chỉnh, quản lý và HIỂN THỊ dữ liệu màn hình lên Canvas."""
+
+    def __init__(self, canvas):
+        """
+        Khởi tạo với một tham chiếu đến tk.Canvas để vẽ lên.
+        canvas: Đối tượng tk.Canvas từ ClientApp.
+        """
+        self.canvas = canvas
+        self.screen_width = None
+        self.screen_height = None
+        self.current_image = None  # Lưu trữ hình ảnh PIL
+        self.tk_image = None       # Lưu trữ hình ảnh ImageTk để hiển thị (QUAN TRỌNG)
+
+    def update_screen(self, image_data):
+        """
+        Cập nhật hình ảnh màn hình từ dữ liệu bytes và vẽ lên canvas.
+        image_data: dữ liệu ảnh dạng bytes.
+        """
+        try:
+            # Mở ảnh từ dữ liệu bytes
+            self.current_image = Image.open(io.BytesIO(image_data))
+            self.screen_width, self.screen_height = self.current_image.size
+
+            # Chuyển đổi PIL Image thành PhotoImage của Tkinter
+            self.tk_image = ImageTk.PhotoImage(self.current_image)
+
+            # Xóa nội dung cũ và vẽ ảnh mới lên canvas
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+
+            # Cấu hình lại vùng cuộn để khớp với kích thước ảnh
+            self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
+
+        except Exception as e:
+            print(f"Lỗi khi cập nhật màn hình: {e}")
+            self.current_image = None
+            self.tk_image = None
+
+    def get_screen_size(self):
+        """Lấy kích thước màn hình của ảnh nhận được (màn hình Host)."""
+        return self.screen_width, self.screen_height
+
+    def scale_coordinates(self, x, y):
+        """
+        Chuyển đổi tọa độ (x, y) trên canvas của Client thành tọa độ trên màn hình của Host.
+        """
+        if not self.screen_width or not self.screen_height:
+            return x, y # Trả về tọa độ gốc nếu chưa có thông tin màn hình
+
+        # Lấy kích thước hiện tại của widget Canvas
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        if canvas_width == 1 or canvas_height == 1: # Canvas chưa được vẽ đầy đủ
+             return x, y
+
+        # Tính toán tỉ lệ và chuyển đổi
+        scaled_x = int((x / canvas_width) * self.screen_width)
+        scaled_y = int((y / canvas_height) * self.screen_height)
+
+        return scaled_x, scaled_y
+
+
 class HostApp:
-    """Ứng dụng Host (máy chủ)"""
+    """Ứng dụng Host (máy chủ) - Đã tối ưu hóa handlers"""
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Remote Desktop - Host")
         self.root.geometry("600x500")
 
+        # Khởi tạo các handler một lần duy nhất
         self.connection = SocketConnection()
         self.keyboard_handler = KeyboardHandler()
         self.mouse_handler = MouseHandler()
         self.video_stream = VideoStream()
         self.message_control = MessageControl()
         self.chat_window = None
+        # ScreenAdapter không thực sự cần thiết ở Host, nhưng giữ lại nếu có logic khác cần
+        self.screen_adapter = ScreenAdapter(None) 
 
         self.is_sharing = False
         self.message_control.set_user_name("Host")
         self.setup_ui()
 
+    # ... (Các phương thức setup_ui, start_sharing, stop_sharing, send_frame giữ nguyên) ...
     def setup_ui(self):
-        """Thiết lập giao diện"""
-        # Frame chính
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+         """Thiết lập giao diện"""
+         # Frame chính
+         main_frame = ttk.Frame(self.root, padding="10")
+         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Tiêu đề
-        title_label = ttk.Label(main_frame, text="Remote Desktop Host",
-                               font=("Arial", 16, "bold"))
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
+         # Tiêu đề
+         title_label = ttk.Label(main_frame, text="Remote Desktop Host",
+                                font=("Arial", 16, "bold"))
+         title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
 
-        # Thông tin kết nối
-        #
-        connection_frame = ttk.LabelFrame(main_frame, text="Connection Settings", padding="10")
-        connection_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+         # Thông tin kết nối
+         #
+         connection_frame = ttk.LabelFrame(main_frame, text="Connection Settings", padding="10")
+         connection_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
 
-        ttk.Label(connection_frame, text="Host:").grid(row=0, column=0, sticky=tk.W)
-        self.host_entry = ttk.Entry(connection_frame, width=20)
-        self.host_entry.insert(0, "localhost")
-        self.host_entry.grid(row=0, column=1, padx=(5, 0))
+         ttk.Label(connection_frame, text="Host:").grid(row=0, column=0, sticky=tk.W)
+         self.host_entry = ttk.Entry(connection_frame, width=20)
+         self.host_entry.insert(0, "localhost")
+         self.host_entry.grid(row=0, column=1, padx=(5, 0))
 
-        ttk.Label(connection_frame, text="Port:").grid(row=1, column=0, sticky=tk.W)
-        self.port_entry = ttk.Entry(connection_frame, width=20)
-        self.port_entry.insert(0, "9999")
-        self.port_entry.grid(row=1, column=1, padx=(5, 0))
+         ttk.Label(connection_frame, text="Port:").grid(row=1, column=0, sticky=tk.W)
+         self.port_entry = ttk.Entry(connection_frame, width=20)
+         self.port_entry.insert(0, "9999")
+         self.port_entry.grid(row=1, column=1, padx=(5, 0))
 
-        # Nút điều khiển
-        control_frame = ttk.Frame(main_frame)
-        control_frame.grid(row=2, column=0, columnspan=2, pady=10)
+         # Nút điều khiển
+         control_frame = ttk.Frame(main_frame)
+         control_frame.grid(row=2, column=0, columnspan=2, pady=10)
 
-        self.start_btn = ttk.Button(control_frame, text="Start Sharing",
-                                   command=self.start_sharing)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 10))
+         self.start_btn = ttk.Button(control_frame, text="Start Sharing",
+                                    command=self.start_sharing)
+         self.start_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.stop_btn = ttk.Button(control_frame, text="Stop Sharing",
-                                  command=self.stop_sharing, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 10))
+         self.stop_btn = ttk.Button(control_frame, text="Stop Sharing",
+                                   command=self.stop_sharing, state=tk.DISABLED)
+         self.stop_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Chat button
-        self.chat_btn = ttk.Button(control_frame, text="Open Chat",
-                                  command=self.toggle_chat, state=tk.DISABLED)
-        self.chat_btn.pack(side=tk.LEFT)
+         # Chat button
+         self.chat_btn = ttk.Button(control_frame, text="Open Chat",
+                                   command=self.toggle_chat, state=tk.DISABLED)
+         self.chat_btn.pack(side=tk.LEFT)
 
-        # Trạng thái
-        self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(main_frame, textvariable=self.status_var)
-        status_label.grid(row=3, column=0, columnspan=2, pady=10)
+         # Trạng thái
+         self.status_var = tk.StringVar(value="Ready")
+         status_label = ttk.Label(main_frame, textvariable=self.status_var)
+         status_label.grid(row=3, column=0, columnspan=2, pady=10)
 
-        # Log
-        log_frame = ttk.LabelFrame(main_frame, text="Activity Log", padding="10")
-        log_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
+         # Log
+         log_frame = ttk.LabelFrame(main_frame, text="Activity Log", padding="10")
+         log_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, width=70)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+         self.log_text = scrolledtext.ScrolledText(log_frame, height=15, width=70)
+         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        # Cấu hình grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(4, weight=1)
+         # Cấu hình grid weights
+         self.root.columnconfigure(0, weight=1)
+         self.root.rowconfigure(0, weight=1)
+         main_frame.columnconfigure(1, weight=1)
+         main_frame.rowconfigure(4, weight=1)
 
     def start_sharing(self):
-        """Bắt đầu chia sẻ màn hình"""
-        host = self.host_entry.get() or "localhost"
-        port = int(self.port_entry.get() or "9999")
+         """Bắt đầu chia sẻ màn hình"""
+         host = self.host_entry.get() or "localhost"
+         port = int(self.port_entry.get() or "9999")
 
-        if self.connection.start_server(host, port):
-            self.is_sharing = True
-            self.status_var.set("Sharing...")
-            self.start_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.NORMAL)
-            self.chat_btn.config(state=tk.NORMAL)  # Enable chat button khi đã sharing
+         if self.connection.start_server(host, port):
+             self.is_sharing = True
+             self.status_var.set("Sharing...")
+             self.start_btn.config(state=tk.DISABLED)
+             self.stop_btn.config(state=tk.NORMAL)
+             self.chat_btn.config(state=tk.NORMAL)  # Enable chat button khi đã sharing
 
-            # Đăng ký handlers
-            self.connection.register_handler('mouse_event', self.handle_mouse_event)
-            self.connection.register_handler('key_event', self.handle_key_event)
-            self.connection.register_handler('chat_message', self.handle_chat_message)
+             # Đăng ký handlers
+             self.connection.register_handler('mouse_event', self.handle_mouse_event)
+             self.connection.register_handler('key_event', self.handle_key_event)
+             self.connection.register_handler('chat_message', self.handle_chat_message)
 
-            # Bắt đầu video stream
-            self.video_stream.start_stream(self.send_frame)
+             # Bắt đầu video stream
+             self.video_stream.start_stream(self.send_frame)
 
-            # Thông báo có client kết nối
-            self.message_control.add_message("SYSTEM", "Client connected - Screen sharing started")
+             # Thông báo có client kết nối
+             self.message_control.add_message("SYSTEM", "Client connected - Screen sharing started")
 
-            # Khởi tạo chat window (chỉ khi đã sharing)
-            if not self.chat_window:
-                self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Host")
+             # Khởi tạo chat window (chỉ khi đã sharing)
+             if not self.chat_window:
+                 self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Host")
 
-            self.log("Started sharing screen")
-        else:
-            messagebox.showerror("Error", "Failed to start server")
+             self.log("Started sharing screen")
+         else:
+             messagebox.showerror("Error", "Failed to start server")
 
     def stop_sharing(self):
-        """Dừng chia sẻ màn hình"""
-        self.is_sharing = False
-        self.video_stream.stop_stream()
-        self.connection.close()
+         """Dừng chia sẻ màn hình"""
+         self.is_sharing = False
+         self.video_stream.stop_stream()
+         self.connection.close()
 
-        self.status_var.set("Ready")
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.chat_btn.config(state=tk.DISABLED)
-        if self.chat_window:
-            self.chat_window.hide_window()
+         self.status_var.set("Ready")
+         self.start_btn.config(state=tk.NORMAL)
+         self.stop_btn.config(state=tk.DISABLED)
+         self.chat_btn.config(state=tk.DISABLED)
+         if self.chat_window:
+             self.chat_window.hide_window()
 
-        # Thông báo ngắt kết nối
-        if self.chat_window:
-            self.message_control.add_message("SYSTEM", "Client disconnected - Screen sharing stopped")
+         # Thông báo ngắt kết nối
+         if self.chat_window:
+             self.message_control.add_message("SYSTEM", "Client disconnected - Screen sharing stopped")
 
-        self.log("Stopped sharing screen")
+         self.log("Stopped sharing screen")
 
     def send_frame(self, frame_data):
-        """Gửi frame video"""
-        if self.is_sharing:
-            # Encode frame data as base64
-            encoded_frame = base64.b64encode(frame_data).decode('utf-8')
-            self.connection.send_data('video_frame', encoded_frame)
-
+         """Gửi frame video"""
+         if self.is_sharing:
+             # Encode frame data as base64
+             encoded_frame = base64.b64encode(frame_data).decode('utf-8')
+             self.connection.send_data('video_frame', encoded_frame)
     def handle_mouse_event(self, mouse_data):
-        """Xử lý sự kiện chuột từ client"""
-        mouse_handler = MouseHandler()
-        mouse_handler.simulate_mouse(mouse_data)
-        self.log(f"Mouse event: {mouse_data['type']}")
+        """Xử lý sự kiện chuột từ client (SỬA LẠI)"""
+        # Sử dụng instance đã có, không tạo mới
+        self.mouse_handler.simulate_mouse(mouse_data)
+        self.log(f"Mouse event: {mouse_data['type']} at ({mouse_data['x']}, {mouse_data['y']})")
 
     def handle_key_event(self, key_data):
-        """Xử lý sự kiện bàn phím từ client"""
-        keyboard_handler = KeyboardHandler()
-        keyboard_handler.simulate_key(key_data)
-        self.log(f"Key event: {key_data['type']}")
+        """Xử lý sự kiện bàn phím từ client (SỬA LẠI)"""
+        # Sử dụng instance đã có, không tạo mới
+        self.keyboard_handler.simulate_key(key_data)
+        self.log(f"Key event: {key_data['type']} - {key_data['key']}")
 
+    # ... (Các phương thức handle_chat_message, toggle_chat, log, run giữ nguyên) ...
     def handle_chat_message(self, chat_data):
-        """Xử lý tin nhắn chat từ client"""
-        if self.chat_window:
-            self.chat_window.receive_message(chat_data)
-        self.log(f"Chat message from {chat_data['sender']}: {chat_data['message'][:30]}...")
+         """Xử lý tin nhắn chat từ client"""
+         if self.chat_window:
+             self.chat_window.receive_message(chat_data)
+         self.log(f"Chat message from {chat_data['sender']}: {chat_data['message'][:30]}...")
 
     def toggle_chat(self):
-        """Mở/đóng cửa sổ chat"""
-        if not self.chat_window:
-            self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Host")
-        self.chat_window.toggle_window()
+         """Mở/đóng cửa sổ chat"""
+         if not self.chat_window:
+             self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Host")
+         self.chat_window.toggle_window()
 
     def log(self, message):
-        """Ghi log"""
-        timestamp = time.strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}\n"
-        self.log_text.insert(tk.END, log_message)
-        self.log_text.see(tk.END)
+         """Ghi log"""
+         timestamp = time.strftime("%H:%M:%S")
+         log_message = f"[{timestamp}] {message}\n"
+         self.log_text.insert(tk.END, log_message)
+         self.log_text.see(tk.END)
 
     def run(self):
-        """Chạy ứng dụng"""
-        self.root.mainloop()
+         """Chạy ứng dụng"""
+         self.root.mainloop()
+
 
 class ClientApp:
-    """Ứng dụng Client (máy khách)"""
+    """Ứng dụng Client (máy khách) - Đã sửa logic hiển thị và điều khiển"""
 
     def __init__(self):
         self.root = tk.Tk()
@@ -852,10 +921,14 @@ class ClientApp:
         self.root.geometry("900x700")
 
         self.connection = SocketConnection()
-        self.keyboard_handler = KeyboardHandler()
-        self.mouse_handler = MouseHandler()
+        self.keyboard_handler = KeyboardHandler() # Vẫn cần cho logic gửi đi
+        self.mouse_handler = MouseHandler()       # Vẫn cần cho logic gửi đi
         self.message_control = MessageControl()
         self.chat_window = None
+        
+        # Sẽ được khởi tạo trong setup_ui sau khi canvas được tạo
+        self.screen_adapter = None 
+        self.canvas = None
 
         self.is_connected = False
         self.is_controlling = False
@@ -864,52 +937,34 @@ class ClientApp:
 
     def setup_ui(self):
         """Thiết lập giao diện"""
-        # Frame chính
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # Thanh điều khiển
+        
+        # ... (Phần control_frame không thay đổi) ...
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        # Kết nối
         ttk.Label(control_frame, text="Host:").pack(side=tk.LEFT)
         self.host_entry = ttk.Entry(control_frame, width=15)
         self.host_entry.insert(0, "localhost")
         self.host_entry.pack(side=tk.LEFT, padx=(5, 10))
-
         ttk.Label(control_frame, text="Port:").pack(side=tk.LEFT)
         self.port_entry = ttk.Entry(control_frame, width=8)
         self.port_entry.insert(0, "9999")
         self.port_entry.pack(side=tk.LEFT, padx=(5, 10))
-
-        self.connect_btn = ttk.Button(control_frame, text="Connect",
-                                     command=self.connect_to_host)
+        self.connect_btn = ttk.Button(control_frame, text="Connect", command=self.connect_to_host)
         self.connect_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.disconnect_btn = ttk.Button(control_frame, text="Disconnect",
-                                        command=self.disconnect_from_host, state=tk.DISABLED)
+        self.disconnect_btn = ttk.Button(control_frame, text="Disconnect", command=self.disconnect_from_host, state=tk.DISABLED)
         self.disconnect_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.control_btn = ttk.Button(control_frame, text="Start Control",
-                                     command=self.toggle_control, state=tk.DISABLED)
+        self.control_btn = ttk.Button(control_frame, text="Start Control", command=self.toggle_control, state=tk.DISABLED)
         self.control_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Chat button
-        self.chat_btn = ttk.Button(control_frame, text="Open Chat",
-                                  command=self.toggle_chat, state=tk.DISABLED)
+        self.chat_btn = ttk.Button(control_frame, text="Open Chat", command=self.toggle_chat, state=tk.DISABLED)
         self.chat_btn.pack(side=tk.LEFT)
-
-        # Trạng thái
         self.status_var = tk.StringVar(value="Disconnected")
         status_label = ttk.Label(control_frame, textvariable=self.status_var)
         status_label.pack(side=tk.RIGHT)
-
-        # Frame cho màn hình
+        
         screen_frame = ttk.LabelFrame(main_frame, text="Remote Screen", padding="5")
         screen_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # Canvas với scrollbars
         canvas_frame = ttk.Frame(screen_frame)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -925,109 +980,112 @@ class ClientApp:
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
 
-        # Screen adapter
-        # self.screen_adapter = ScreenAdapter(self.canvas)
+        # (SỬA LẠI) Khởi tạo ScreenAdapter VỚI canvas
+        self.screen_adapter = ScreenAdapter(self.canvas)
 
-        # Bind canvas events
+        # Bind events (giữ nguyên)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Button-3>", self.on_canvas_click)
         self.canvas.bind("<Motion>", self.on_canvas_motion)
         self.canvas.bind("<MouseWheel>", self.on_canvas_scroll)
-        self.canvas.focus_set()  # For keyboard events
+        self.canvas.focus_set()
         self.canvas.bind("<KeyPress>", self.on_canvas_key)
         self.canvas.bind("<KeyRelease>", self.on_canvas_key)
-
-        # Cấu hình grid weights
+        
+        # ... (Phần cấu hình grid weights không thay đổi) ...
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=1)
 
+    # ... (Các phương thức connect, disconnect, toggle_control giữ nguyên) ...
     def connect_to_host(self):
-        """Kết nối đến host"""
-        host = self.host_entry.get() or "localhost"
-        port = int(self.port_entry.get() or "9999")
+         """Kết nối đến host"""
+         host = self.host_entry.get() or "localhost"
+         port = int(self.port_entry.get() or "9999")
 
-        if self.connection.connect_to_server(host, port):
-            self.is_connected = True
-            self.status_var.set("Connected")
-            self.connect_btn.config(state=tk.DISABLED)
-            self.disconnect_btn.config(state=tk.NORMAL)
-            self.control_btn.config(state=tk.NORMAL)
-            self.chat_btn.config(state=tk.NORMAL)  # Enable chat button khi đã kết nối
+         if self.connection.connect_to_server(host, port):
+             self.is_connected = True
+             self.status_var.set("Connected")
+             self.connect_btn.config(state=tk.DISABLED)
+             self.disconnect_btn.config(state=tk.NORMAL)
+             self.control_btn.config(state=tk.NORMAL)
+             self.chat_btn.config(state=tk.NORMAL)  # Enable chat button khi đã kết nối
 
-            # Đăng ký handler cho video frame và chat
-            self.connection.register_handler('video_frame', self.handle_video_frame)
-            self.connection.register_handler('chat_message', self.handle_chat_message)
+             # Đăng ký handler cho video frame và chat
+             self.connection.register_handler('video_frame', self.handle_video_frame)
+             self.connection.register_handler('chat_message', self.handle_chat_message)
 
-            # Khởi tạo chat window (chỉ khi đã kết nối)
-            if not self.chat_window:
-                self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Client")
+             # Khởi tạo chat window (chỉ khi đã kết nối)
+             if not self.chat_window:
+                 self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Client")
 
-            # Thông báo kết nối thành công
-            self.message_control.add_message("SYSTEM", "Connected to host successfully")
-        else:
-            messagebox.showerror("Error", "Failed to connect to host")
+             # Thông báo kết nối thành công
+             self.message_control.add_message("SYSTEM", "Connected to host successfully")
+         else:
+             messagebox.showerror("Error", "Failed to connect to host")
 
     def disconnect_from_host(self):
-        """Ngắt kết nối khỏi host"""
-        self.is_connected = False
-        self.is_controlling = False
-        self.connection.close()
+         """Ngắt kết nối khỏi host"""
+         self.is_connected = False
+         self.is_controlling = False
+         self.connection.close()
 
-        self.status_var.set("Disconnected")
-        self.connect_btn.config(state=tk.NORMAL)
-        self.disconnect_btn.config(state=tk.DISABLED)
-        self.control_btn.config(state=tk.DISABLED, text="Start Control")
-        self.chat_btn.config(state=tk.DISABLED)
-        if self.chat_window:
-            self.chat_window.hide_window()
+         self.status_var.set("Disconnected")
+         self.connect_btn.config(state=tk.NORMAL)
+         self.disconnect_btn.config(state=tk.DISABLED)
+         self.control_btn.config(state=tk.DISABLED, text="Start Control")
+         self.chat_btn.config(state=tk.DISABLED)
+         if self.chat_window:
+             self.chat_window.hide_window()
 
-        # Xóa màn hình
-        self.canvas.delete("all")
+         # Xóa màn hình
+         self.canvas.delete("all")
 
-        # Thông báo ngắt kết nối
-        if self.chat_window:
-            self.message_control.add_message("SYSTEM", "Disconnected from host")
-
+         # Thông báo ngắt kết nối
+         if self.chat_window:
+             self.message_control.add_message("SYSTEM", "Disconnected from host")
     def toggle_control(self):
-        """Bật/tắt điều khiển"""
-        if not self.is_controlling:
-            self.is_controlling = True
-            self.control_btn.config(text="Stop Control")
-            self.status_var.set("Connected - Controlling")
-        else:
-            self.is_controlling = False
-            self.control_btn.config(text="Start Control")
-            self.status_var.set("Connected")
+         """Bật/tắt điều khiển"""
+         if not self.is_controlling:
+             self.is_controlling = True
+             self.control_btn.config(text="Stop Control")
+             self.status_var.set("Connected - Controlling")
+         else:
+             self.is_controlling = False
+             self.control_btn.config(text="Start Control")
+             self.status_var.set("Connected")
 
     def handle_video_frame(self, frame_data):
-        """Xử lý frame video nhận được"""
+        """Xử lý frame video nhận được (SỬA LẠI)"""
         try:
-            # Decode base64
             image_data = base64.b64decode(frame_data.encode('utf-8'))
+            # Giao toàn bộ việc cập nhật và hiển thị cho adapter
             self.screen_adapter.update_screen(image_data)
         except Exception as e:
             print(f"Video frame error: {e}")
 
+    # ... (handle_chat_message, toggle_chat giữ nguyên) ...
     def handle_chat_message(self, chat_data):
-        """Xử lý tin nhắn chat từ host"""
-        if self.chat_window:
-            self.chat_window.receive_message(chat_data)
+         """Xử lý tin nhắn chat từ host"""
+         if self.chat_window:
+             self.chat_window.receive_message(chat_data)
 
     def toggle_chat(self):
-        """Mở/đóng cửa sổ chat"""
-        if not self.chat_window:
-            self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Client")
-        self.chat_window.toggle_window()
+         """Mở/đóng cửa sổ chat"""
+         if not self.chat_window:
+             self.chat_window = WindowChat(self.root, self.connection, self.message_control, self.canvas, "Client")
+         self.chat_window.toggle_window()
 
     def on_canvas_click(self, event):
-        """Xử lý click trên canvas"""
+        """Xử lý click trên canvas (SỬA LẠI)"""
         if self.is_controlling:
+            # Chuyển đổi tọa độ trước khi gửi
+            scaled_x, scaled_y = self.screen_adapter.scale_coordinates(event.x, event.y)
             mouse_data = {
                 'type': 'mouse_click',
-                'x': event.x,
-                'y': event.y,
+                'x': scaled_x,
+                'y': scaled_y,
                 'button': 'Button.left' if event.num == 1 else 'Button.right',
                 'pressed': True,
                 'timestamp': time.time()
@@ -1035,23 +1093,27 @@ class ClientApp:
             self.connection.send_data('mouse_event', mouse_data)
 
     def on_canvas_motion(self, event):
-        """Xử lý di chuyển chuột trên canvas"""
+        """Xử lý di chuyển chuột trên canvas (SỬA LẠI)"""
         if self.is_controlling:
+            # Chuyển đổi tọa độ trước khi gửi
+            scaled_x, scaled_y = self.screen_adapter.scale_coordinates(event.x, event.y)
             mouse_data = {
                 'type': 'mouse_move',
-                'x': event.x,
-                'y': event.y,
+                'x': scaled_x,
+                'y': scaled_y,
                 'timestamp': time.time()
             }
             self.connection.send_data('mouse_event', mouse_data)
 
     def on_canvas_scroll(self, event):
-        """Xử lý scroll trên canvas"""
+        """Xử lý scroll trên canvas (SỬA LẠI)"""
         if self.is_controlling:
+            # Chuyển đổi tọa độ trước khi gửi
+            scaled_x, scaled_y = self.screen_adapter.scale_coordinates(event.x, event.y)
             mouse_data = {
                 'type': 'mouse_scroll',
-                'x': event.x,
-                'y': event.y,
+                'x': scaled_x,
+                'y': scaled_y,
                 'dx': 0,
                 'dy': event.delta,
                 'timestamp': time.time()
@@ -1059,11 +1121,11 @@ class ClientApp:
             self.connection.send_data('mouse_event', mouse_data)
 
     def on_canvas_key(self, event):
-        """Xử lý phím trên canvas"""
+        """Xử lý phím trên canvas (giữ nguyên logic)"""
         if self.is_controlling:
             key_data = {
                 'type': 'key_press' if event.type == '2' else 'key_release',
-                'key': f"'{event.char}'" if event.char else f"Key.{event.keysym.lower()}",
+                'key': f"'{event.char}'" if event.char and event.char.isprintable() else f"Key.{event.keysym.lower()}",
                 'timestamp': time.time()
             }
             self.connection.send_data('key_event', key_data)
