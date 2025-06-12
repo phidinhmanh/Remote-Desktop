@@ -30,7 +30,7 @@ class RemoteInputHandler:
         try:
             event = json.loads(event_data)
             event_type = event.get("type")
-            
+
             if event_type == "mouse":
                 self.handle_mouse_event(event)
             elif event_type == "keyboard":
@@ -44,7 +44,7 @@ class RemoteInputHandler:
         x = int(event['x'] * self.screen_width)
         y = int(event['y'] * self.screen_height)
         self.mouse.position = (x, y)
-        
+
         action = event.get("action")
         if action == "click":
             button = Button[event['button']]
@@ -59,7 +59,7 @@ class RemoteInputHandler:
         """Xử lý các sự kiện bàn phím."""
         key_str = event['key']
         action = event.get("action")
-        
+
         try:
             # Cố gắng xử lý các phím đặc biệt từ pynput.keyboard.Key
             key = getattr(Key, key_str)
@@ -98,7 +98,7 @@ def recvall(sock, n):
 
 # --- Lớp Server chính ---
 class RemoteDesktopServer:
-    def __init__(self, host='0.0.0.0', port=9999):
+    def __init__(self, host='192.168.1.7', port=9999):
         self.host = host
         self.port = port
         self.server_socket = None
@@ -162,18 +162,18 @@ class RemoteDesktopServer:
             while self.is_running and self.client_conn:
                 try:
                     start_time = time.time()
-                    
+
                     # Chụp màn hình
                     img = sct.grab(monitor)
                     img_pil = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-                    
+
                     # Nén ảnh thành JPEG
                     # Thay đổi chất lượng (quality) để cân bằng giữa độ nét và băng thông
                     img_np = np.array(img_pil)
                     frame = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                     _, encoded_frame = cv2.imencode(".jpg", frame, encode_param)
-                    
+
                     # Gửi khung hình đã nén
                     send_msg(self.client_conn, encoded_frame.tobytes())
 
@@ -201,7 +201,7 @@ class RemoteDesktopServer:
                     self.update_ui_status("Client đã ngắt kết nối (input).")
                     break
                 # Xử lý sự kiện trong một thread riêng để không làm chậm việc nhận
-                threading.Thread(target=self.input_handler.process_event, args=(data.decode('utf-8'),), daemon=True).start()
+                self.input_handler.process_event(data.decode('utf-8'))
             except (ConnectionResetError, BrokenPipeError):
                 break
             except Exception as e:
