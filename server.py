@@ -1,85 +1,21 @@
 import socket
 import threading
-import time
 import struct
 import json
-from mss import mss
-from PIL import Image
-import numpy as np
+import queue
+from PIL import Image, ImageTk
 import cv2
-from pynput.mouse import Button, Controller as MouseController
-from pynput.keyboard import Key, Controller as KeyboardController
+import numpy as np
 import tkinter as tk
-from tkinter import ttk
-import traceback
+from tkinter import ttk, messagebox
+from pynput import mouse, keyboard
 
-# --- Trình xử lý điều khiển từ xa ---
-class RemoteInputHandler:
-    """Xử lý các sự kiện chuột và bàn phím từ xa."""
-    def __init__(self):
-        self.mouse = MouseController()
-        self.keyboard = KeyboardController()
-        # Lấy kích thước màn hình để tính toán tọa độ tương đối
-        with mss() as sct:
-            monitor = sct.monitors[1]
-            self.screen_width = monitor["width"]
-            self.screen_height = monitor["height"]
-
-    def process_event(self, event_data):
-        """Phân tích và thực thi một sự kiện điều khiển."""
-        try:
-            event = json.loads(event_data)
-            event_type = event.get("type")
-
-            if event_type == "mouse":
-                self.handle_mouse_event(event)
-            elif event_type == "keyboard":
-                self.handle_keyboard_event(event)
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Lỗi xử lý dữ liệu sự kiện: {e}")
-
-    def handle_mouse_event(self, event):
-        """Xử lý các sự kiện chuột."""
-        # Chuyển đổi tọa độ tương đối (0.0 - 1.0) thành tọa độ tuyệt đối trên màn hình
-        x = int(event['x'] * self.screen_width)
-        y = int(event['y'] * self.screen_height)
-        self.mouse.position = (x, y)
-
-        action = event.get("action")
-        if action == "click":
-            button = Button[event['button']]
-            if event['pressed']:
-                self.mouse.press(button)
-            else:
-                self.mouse.release(button)
-        elif action == "scroll":
-            self.mouse.scroll(event['dx'], event['dy'])
-
-    def handle_keyboard_event(self, event):
-        """Xử lý các sự kiện bàn phím."""
-        key_str = event['key']
-        action = event.get("action")
-
-        try:
-            # Cố gắng xử lý các phím đặc biệt từ pynput.keyboard.Key
-            key = getattr(Key, key_str)
-        except AttributeError:
-            # Nếu không phải phím đặc biệt, nó là một ký tự thông thường
-            key = key_str
-
-        if action == 'press':
-            self.keyboard.press(key)
-        elif action == 'release':
-            self.keyboard.release(key)
-
-# --- Chức năng Mạng ---
+# --- Utils ---
 def send_msg(sock, msg):
-    """Gửi một thông điệp với tiền tố là độ dài của nó."""
     msg = struct.pack('>I', len(msg)) + msg
     sock.sendall(msg)
 
 def recv_msg(sock):
-    """Nhận một thông điệp có tiền tố là độ dài."""
     raw_msglen = recvall(sock, 4)
     if not raw_msglen:
         return None
@@ -87,7 +23,6 @@ def recv_msg(sock):
     return recvall(sock, msglen)
 
 def recvall(sock, n):
-    """Nhận chính xác n byte từ socket."""
     data = bytearray()
     while len(data) < n:
         packet = sock.recv(n - len(data))
@@ -96,152 +31,179 @@ def recvall(sock, n):
         data.extend(packet)
     return data
 
-# --- Lớp Server chính ---
-class RemoteDesktopServer:
-    def __init__(self, host='192.168.1.7', port=9999):
-        self.host = host
-        self.port = port
-        self.server_socket = None
-        self.client_conn = None
-        self.is_running = False
-        self.input_handler = RemoteInputHandler()
-        self.ui = None
-        self.capture_thread = None
-        self.receive_thread = None
+# --- Client Class ---
+class RemoteDesktopClient:
+    def __init__(self, root):
+        self.root = root
+        self.sock = None
+        self.is_connected = False
+        self.frame_queue = queue.Queue(maxsize=30)
+        self.input_listeners = []
 
-    def start(self):
-        """Khởi động server, lắng nghe kết nối."""
-        self.is_running = True
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(1)
-        self.update_ui_status(f"Server đang lắng nghe trên {self.host}:{self.port}")
+        self.init_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Chạy vòng lặp chấp nhận kết nối trong một thread riêng để không block UI
-        threading.Thread(target=self.accept_connections, daemon=True).start()
+    def init_ui(self):
+        self.root.title("Remote Desktop Client")
+        self.root.geometry("1024x768")
 
-    def accept_connections(self):
-        """Vòng lặp chấp nhận kết nối từ client."""
-        while self.is_running:
+        control_frame = ttk.Frame(self.root, padding=10)
+        control_frame.pack(fill=tk.X)
+
+        self.ip_entry = self.create_labeled_entry(control_frame, "Server IP:", "127.0.0.1")
+        self.port_entry = self.create_labeled_entry(control_frame, "Port:", "9999")
+
+        self.connect_button = ttk.Button(control_frame, text="Kết nối", command=self.toggle_connection)
+        self.connect_button.pack(side=tk.LEFT, padx=10)
+
+        self.screen_label = ttk.Label(self.root, background="black")
+        self.screen_label.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        self.screen_label.bind("<Button>", self.on_mouse_click)
+        self.screen_label.bind("<ButtonRelease>", self.on_mouse_click)
+        self.screen_label.bind("<Motion>", self.on_mouse_move)
+
+        self.status_var = tk.StringVar(value="Sẵn sàng để kết nối.")
+        ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def create_labeled_entry(self, parent, label_text, default_value):
+        ttk.Label(parent, text=label_text).pack(side=tk.LEFT, padx=5)
+        entry = ttk.Entry(parent, width=15)
+        entry.insert(0, default_value)
+        entry.pack(side=tk.LEFT, padx=5)
+        return entry
+
+    def toggle_connection(self):
+        if self.is_connected:
+            self.disconnect()
+        else:
+            self.connect()
+
+    def connect(self):
+        try:
+            host = self.ip_entry.get()
+            port = int(self.port_entry.get())
+            self.sock = socket.create_connection((host, port))
+            self.is_connected = True
+            self.status_var.set(f"Đã kết nối tới {host}:{port}")
+            self.connect_button.config(text="Ngắt kết nối")
+
+            threading.Thread(target=self.receive_frames, daemon=True).start()
+            self.process_frame_queue()
+            self.start_input_listeners()
+            self.screen_label.focus_set()
+
+        except Exception as e:
+            messagebox.showerror("Lỗi kết nối", str(e))
+            self.sock = None
+
+    def disconnect(self):
+        self.is_connected = False
+        self.connect_button.config(text="Kết nối")
+        self.status_var.set("Đã ngắt kết nối.")
+        self.stop_input_listeners()
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        self.screen_label.config(image='')
+        self.screen_label.imgtk = None
+        while not self.frame_queue.empty():
+            self.frame_queue.get()
+
+    def receive_frames(self):
+        while self.is_connected:
             try:
-                self.client_conn, addr = self.server_socket.accept()
-                self.update_ui_status(f"Đã kết nối bởi {addr}")
-                # Bắt đầu các thread để giao tiếp với client
-                self.capture_thread = threading.Thread(target=self.stream_screen, daemon=True)
-                self.receive_thread = threading.Thread(target=self.receive_inputs, daemon=True)
-                self.capture_thread.start()
-                self.receive_thread.start()
-            except OSError:
-                # Socket đã bị đóng
-                break
-            except Exception as e:
-                self.update_ui_status(f"Lỗi chấp nhận kết nối: {e}")
-                break
-        self.update_ui_status("Vòng lặp chấp nhận đã dừng.")
-
-    def stop(self):
-        """Dừng server và đóng các kết nối."""
-        self.is_running = False
-        if self.client_conn:
-            try:
-                self.client_conn.close()
-            except Exception as e:
-                print(f"Lỗi khi đóng client socket: {e}")
-        if self.server_socket:
-            try:
-                # Đóng socket để ngắt vòng lặp accept()
-                self.server_socket.close()
-            except Exception as e:
-                print(f"Lỗi khi đóng server socket: {e}")
-        self.update_ui_status("Server đã dừng.")
-
-    def stream_screen(self):
-        """Chụp màn hình và gửi các khung hình đến client."""
-        with mss() as sct:
-            monitor = sct.monitors[1]
-            while self.is_running and self.client_conn:
-                try:
-                    start_time = time.time()
-
-                    # Chụp màn hình
-                    img = sct.grab(monitor)
-                    img_pil = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-
-                    # Nén ảnh thành JPEG
-                    # Thay đổi chất lượng (quality) để cân bằng giữa độ nét và băng thông
-                    img_np = np.array(img_pil)
-                    frame = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-                    _, encoded_frame = cv2.imencode(".jpg", frame, encode_param)
-
-                    # Gửi khung hình đã nén
-                    send_msg(self.client_conn, encoded_frame.tobytes())
-
-                    # Giới hạn tốc độ khung hình (FPS)
-                    elapsed = time.time() - start_time
-                    sleep_time = (1/30) - elapsed # Mục tiêu 30 FPS
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-
-                except (ConnectionResetError, BrokenPipeError):
-                    self.update_ui_status("Client đã ngắt kết nối.")
+                data = recv_msg(self.sock)
+                if not data:
                     break
-                except Exception as e:
-                    self.update_ui_status(f"Lỗi khi stream: {e}")
-                    traceback.print_exc()
-                    break
-        self.client_conn.close()
+                if not self.frame_queue.full():
+                    self.frame_queue.put(data)
+            except:
+                break
+        self.root.after(0, self.disconnect)
 
-    def receive_inputs(self):
-        """Nhận và xử lý các lệnh điều khiển từ client."""
-        while self.is_running and self.client_conn:
+    def process_frame_queue(self):
+        try:
+            frame_data = self.frame_queue.get_nowait()
+            frame_np = np.frombuffer(frame_data, np.uint8)
+            frame = cv2.imdecode(frame_np, cv2.IMREAD_UNCHANGED)
+            if frame is not None:
+                self.update_screen(frame)
+        except queue.Empty:
+            pass
+        if self.is_connected:
+            self.root.after(15, self.process_frame_queue)
+
+    def update_screen(self, frame):
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        img.thumbnail((self.screen_label.winfo_width(), self.screen_label.winfo_height()), Image.Resampling.LANCZOS)
+        img_tk = ImageTk.PhotoImage(image=img)
+        self.screen_label.imgtk = img_tk
+        self.screen_label.config(image=img_tk)
+
+    def send_event(self, data):
+        if self.is_connected and self.sock:
             try:
-                data = recv_msg(self.client_conn)
-                if data is None:
-                    self.update_ui_status("Client đã ngắt kết nối (input).")
-                    break
-                # Xử lý sự kiện trong một thread riêng để không làm chậm việc nhận
-                self.input_handler.process_event(data.decode('utf-8'))
-            except (ConnectionResetError, BrokenPipeError):
-                break
-            except Exception as e:
-                self.update_ui_status(f"Lỗi khi nhận input: {e}")
-                break
+                send_msg(self.sock, json.dumps(data).encode('utf-8'))
+            except:
+                self.root.after(0, self.disconnect)
 
-    def create_ui(self):
-        """Tạo giao diện người dùng Tkinter cho server."""
-        self.ui = tk.Tk()
-        self.ui.title("Remote Desktop Server")
-        self.ui.geometry("400x150")
+    def start_input_listeners(self):
+        self.input_listeners = [
+            mouse.Listener(on_click=self.on_pynput_mouse, on_scroll=self.on_pynput_scroll),
+            keyboard.Listener(on_press=lambda k: self.send_key_event(k, 'press'),
+                              on_release=lambda k: self.send_key_event(k, 'release'))
+        ]
+        for listener in self.input_listeners:
+            listener.start()
 
-        main_frame = ttk.Frame(self.ui, padding="10")
-        main_frame.grid(row=0, column=0, sticky="nsew")
+    def stop_input_listeners(self):
+        for listener in self.input_listeners:
+            listener.stop()
+        self.input_listeners = []
 
-        self.status_label = ttk.Label(main_frame, text="Server chưa chạy", wraplength=380)
-        self.status_label.pack(pady=10)
+    def on_mouse_click(self, event):
+        button_map = {1: 'left', 2: 'middle', 3: 'right'}
+        pressed = event.type == tk.EventType.ButtonPress
+        rel_x = event.x / max(1, self.screen_label.winfo_width())
+        rel_y = event.y / max(1, self.screen_label.winfo_height())
+        self.send_event({'type': 'mouse', 'action': 'click', 'x': rel_x, 'y': rel_y, 'button': button_map.get(event.num), 'pressed': pressed})
 
-        start_button = ttk.Button(main_frame, text="Bắt đầu Server", command=self.start)
-        start_button.pack(pady=5)
+    def on_mouse_move(self, event):
+        rel_x = event.x / max(1, self.screen_label.winfo_width())
+        rel_y = event.y / max(1, self.screen_label.winfo_height())
+        self.send_event({'type': 'mouse', 'action': 'move', 'x': rel_x, 'y': rel_y})
 
-        stop_button = ttk.Button(main_frame, text="Dừng Server", command=self.on_closing)
-        stop_button.pack(pady=5)
+    def get_relative_coords(self, abs_x, abs_y):
+        win_x, win_y = self.screen_label.winfo_rootx(), self.screen_label.winfo_rooty()
+        win_w, win_h = self.screen_label.winfo_width(), self.screen_label.winfo_height()
+        if win_w == 0 or win_h == 0:
+            return None
+        rel_x, rel_y = (abs_x - win_x) / win_w, (abs_y - win_y) / win_h
+        return (rel_x, rel_y) if 0 <= rel_x <= 1 and 0 <= rel_y <= 1 else None
 
-        self.ui.protocol("WM_DELETE_WINDOW", self.on_closing)
-        return self.ui
+    def on_pynput_mouse(self, x, y, button, pressed):
+        coords = self.get_relative_coords(x, y)
+        if coords:
+            self.send_event({'type': 'mouse', 'action': 'click', 'x': coords[0], 'y': coords[1], 'button': button.name, 'pressed': pressed})
 
-    def update_ui_status(self, message):
-        """Cập nhật nhãn trạng thái trên UI."""
-        print(message) # In ra console để debug
-        if self.ui and self.status_label:
-            self.ui.after(0, lambda: self.status_label.config(text=message))
+    def on_pynput_scroll(self, x, y, dx, dy):
+        coords = self.get_relative_coords(x, y)
+        if coords:
+            self.send_event({'type': 'mouse', 'action': 'scroll', 'x': coords[0], 'y': coords[1], 'dx': dx, 'dy': dy})
 
-    def on_closing(self):
-        """Xử lý sự kiện đóng cửa sổ UI."""
-        self.stop()
-        if self.ui:
-            self.ui.destroy()
+    def send_key_event(self, key, action):
+        if self.root.focus_get() is not self.screen_label:
+            return
+        key_str = key.name if isinstance(key, keyboard.Key) else key.char
+        if key_str:
+            self.send_event({'type': 'keyboard', 'action': action, 'key': key_str})
+
+    def on_close(self):
+        if self.is_connected:
+            self.disconnect()
+        self.root.destroy()
 
 if __name__ == '__main__':
-    server = RemoteDesktopServer()
-    app_ui = server.create_ui()
-    app_ui.mainloop()
+    root = tk.Tk()
+    app = RemoteDesktopClient(root)
+    root.mainloop()
