@@ -1,19 +1,68 @@
 import socket
 import threading
+import time
 import struct
 import json
-import queue
-from PIL import Image, ImageTk
-import cv2
+import traceback
+from mss import mss
+from PIL import Image
 import numpy as np
+import cv2
+from pynput.mouse import Button, Controller as MouseController
+from pynput.keyboard import Key, Controller as KeyboardController
 import tkinter as tk
-from tkinter import ttk, messagebox
-from pynput import mouse, keyboard
+from tkinter import ttk
+import os
 
-# --- Utils ---
+
+class RemoteInputHandler:
+    def __init__(self):
+        self.mouse = MouseController()
+        self.keyboard = KeyboardController()
+        with mss() as sct:
+            monitor = sct.monitors[1]
+            self.screen_width = monitor["width"]
+            self.screen_height = monitor["height"]
+
+    def process_event(self, event_data):
+        try:
+            event = json.loads(event_data)
+            if event.get("type") == "mouse":
+                self._handle_mouse(event)
+            elif event.get("type") == "keyboard":
+                self._handle_keyboard(event)
+        except Exception as e:
+            print(f"[Error] Event processing: {e}")
+
+    def _handle_mouse(self, event):
+        x = int(event['x'] * self.screen_width)
+        y = int(event['y'] * self.screen_height)
+        self.mouse.position = (x, y)
+
+        action = event.get("action")
+        if action == "click":
+            button = Button[event['button']]
+            if event['pressed']:
+                self.mouse.press(button)
+            else:
+                self.mouse.release(button)
+        elif action == "scroll":
+            self.mouse.scroll(event['dx'], event['dy'])
+
+    def _handle_keyboard(self, event):
+        key_str = event['key']
+        action = event.get("action")
+
+        key = getattr(Key, key_str, key_str)
+
+        if action == "press":
+            self.keyboard.press(key)
+        elif action == "release":
+            self.keyboard.release(key)
+
+
 def send_msg(sock, msg):
-    msg = struct.pack('>I', len(msg)) + msg
-    sock.sendall(msg)
+    sock.sendall(struct.pack('>I', len(msg)) + msg)
 
 def recv_msg(sock):
     raw_msglen = recvall(sock, 4)
@@ -31,179 +80,110 @@ def recvall(sock, n):
         data.extend(packet)
     return data
 
-# --- Client Class ---
-class RemoteDesktopClient:
-    def __init__(self, root):
-        self.root = root
-        self.sock = None
-        self.is_connected = False
-        self.frame_queue = queue.Queue(maxsize=30)
-        self.input_listeners = []
 
-        self.init_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+class RemoteDesktopServer:
+    def __init__(self, host='0.0.0.0', port=9999):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.client_conn = None
+        self.running = False
+        self.input_handler = RemoteInputHandler()
+        self.capture_thread = None
+        self.receive_thread = None
+        self.ui = None
 
-    def init_ui(self):
-        self.root.title("Remote Desktop Client")
-        self.root.geometry("1024x768")
+    def start(self):
+        self.running = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(1)
+        self._update_status(f"Listening on {self.host}:{self.port}")
+        threading.Thread(target=self._accept_clients, daemon=True).start()
 
-        control_frame = ttk.Frame(self.root, padding=10)
-        control_frame.pack(fill=tk.X)
-
-        self.ip_entry = self.create_labeled_entry(control_frame, "Server IP:", "127.0.0.1")
-        self.port_entry = self.create_labeled_entry(control_frame, "Port:", "9999")
-
-        self.connect_button = ttk.Button(control_frame, text="Kết nối", command=self.toggle_connection)
-        self.connect_button.pack(side=tk.LEFT, padx=10)
-
-        self.screen_label = ttk.Label(self.root, background="black")
-        self.screen_label.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
-        self.screen_label.bind("<Button>", self.on_mouse_click)
-        self.screen_label.bind("<ButtonRelease>", self.on_mouse_click)
-        self.screen_label.bind("<Motion>", self.on_mouse_move)
-
-        self.status_var = tk.StringVar(value="Sẵn sàng để kết nối.")
-        ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
-
-    def create_labeled_entry(self, parent, label_text, default_value):
-        ttk.Label(parent, text=label_text).pack(side=tk.LEFT, padx=5)
-        entry = ttk.Entry(parent, width=15)
-        entry.insert(0, default_value)
-        entry.pack(side=tk.LEFT, padx=5)
-        return entry
-
-    def toggle_connection(self):
-        if self.is_connected:
-            self.disconnect()
-        else:
-            self.connect()
-
-    def connect(self):
-        try:
-            host = self.ip_entry.get()
-            port = int(self.port_entry.get())
-            self.sock = socket.create_connection((host, port))
-            self.is_connected = True
-            self.status_var.set(f"Đã kết nối tới {host}:{port}")
-            self.connect_button.config(text="Ngắt kết nối")
-
-            threading.Thread(target=self.receive_frames, daemon=True).start()
-            self.process_frame_queue()
-            self.start_input_listeners()
-            self.screen_label.focus_set()
-
-        except Exception as e:
-            messagebox.showerror("Lỗi kết nối", str(e))
-            self.sock = None
-
-    def disconnect(self):
-        self.is_connected = False
-        self.connect_button.config(text="Kết nối")
-        self.status_var.set("Đã ngắt kết nối.")
-        self.stop_input_listeners()
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-        self.screen_label.config(image='')
-        self.screen_label.imgtk = None
-        while not self.frame_queue.empty():
-            self.frame_queue.get()
-
-    def receive_frames(self):
-        while self.is_connected:
+    def _accept_clients(self):
+        while self.running:
             try:
-                data = recv_msg(self.sock)
-                if not data:
+                self.client_conn, addr = self.server_socket.accept()
+                self._update_status(f"Connected to {addr}")
+
+                self.capture_thread = threading.Thread(target=self._stream_screen, daemon=True)
+                self.receive_thread = threading.Thread(target=self._receive_events, daemon=True)
+
+                self.capture_thread.start()
+                self.receive_thread.start()
+            except Exception as e:
+                self._update_status(f"[Error] Accepting client: {e}")
+
+    def _stream_screen(self):
+        with mss() as sct:
+            monitor = sct.monitors[1]
+            while self.running and self.client_conn:
+                try:
+                    start = time.time()
+                    img = sct.grab(monitor)
+                    pil_img = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+                    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    send_msg(self.client_conn, buffer.tobytes())
+                    time.sleep(max(0, (1/30) - (time.time() - start)))
+                except Exception as e:
+                    self._update_status(f"[Error] Streaming: {e}")
+                    traceback.print_exc()
                     break
-                if not self.frame_queue.full():
-                    self.frame_queue.put(data)
-            except:
-                break
-        self.root.after(0, self.disconnect)
 
-    def process_frame_queue(self):
-        try:
-            frame_data = self.frame_queue.get_nowait()
-            frame_np = np.frombuffer(frame_data, np.uint8)
-            frame = cv2.imdecode(frame_np, cv2.IMREAD_UNCHANGED)
-            if frame is not None:
-                self.update_screen(frame)
-        except queue.Empty:
-            pass
-        if self.is_connected:
-            self.root.after(15, self.process_frame_queue)
-
-    def update_screen(self, frame):
-        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        img.thumbnail((self.screen_label.winfo_width(), self.screen_label.winfo_height()), Image.Resampling.LANCZOS)
-        img_tk = ImageTk.PhotoImage(image=img)
-        self.screen_label.imgtk = img_tk
-        self.screen_label.config(image=img_tk)
-
-    def send_event(self, data):
-        if self.is_connected and self.sock:
+    def _receive_events(self):
+        while self.running and self.client_conn:
             try:
-                send_msg(self.sock, json.dumps(data).encode('utf-8'))
-            except:
-                self.root.after(0, self.disconnect)
+                data = recv_msg(self.client_conn)
+                if data is None:
+                    self._update_status("Client disconnected")
+                    break
+                threading.Thread(target=self.input_handler.process_event, args=(data.decode(),), daemon=True).start()
+            except Exception as e:
+                self._update_status(f"[Error] Receiving input: {e}")
+                traceback.print_exc()
+                break
 
-    def start_input_listeners(self):
-        self.input_listeners = [
-            mouse.Listener(on_click=self.on_pynput_mouse, on_scroll=self.on_pynput_scroll),
-            keyboard.Listener(on_press=lambda k: self.send_key_event(k, 'press'),
-                              on_release=lambda k: self.send_key_event(k, 'release'))
-        ]
-        for listener in self.input_listeners:
-            listener.start()
+    def stop(self):
+        self.running = False
+        if self.client_conn:
+            try: self.client_conn.close()
+            except: pass
+        if self.server_socket:
+            try: self.server_socket.close()
+            except: pass
+        self._update_status("Server stopped")
 
-    def stop_input_listeners(self):
-        for listener in self.input_listeners:
-            listener.stop()
-        self.input_listeners = []
+    def _update_status(self, msg):
+        print(msg)
+        if self.ui and hasattr(self, 'status_label'):
+            self.ui.after(0, lambda: self.status_label.config(text=msg))
 
-    def on_mouse_click(self, event):
-        button_map = {1: 'left', 2: 'middle', 3: 'right'}
-        pressed = event.type == tk.EventType.ButtonPress
-        rel_x = event.x / max(1, self.screen_label.winfo_width())
-        rel_y = event.y / max(1, self.screen_label.winfo_height())
-        self.send_event({'type': 'mouse', 'action': 'click', 'x': rel_x, 'y': rel_y, 'button': button_map.get(event.num), 'pressed': pressed})
+    def _on_close(self):
+        self.stop()
+        if self.ui:
+            self.ui.destroy()
 
-    def on_mouse_move(self, event):
-        rel_x = event.x / max(1, self.screen_label.winfo_width())
-        rel_y = event.y / max(1, self.screen_label.winfo_height())
-        self.send_event({'type': 'mouse', 'action': 'move', 'x': rel_x, 'y': rel_y})
+    def run_ui(self):
+        self.ui = tk.Tk()
+        self.ui.title("Remote Desktop Server")
+        self.ui.geometry("400x180")
+        self.ui.resizable(False, False)
 
-    def get_relative_coords(self, abs_x, abs_y):
-        win_x, win_y = self.screen_label.winfo_rootx(), self.screen_label.winfo_rooty()
-        win_w, win_h = self.screen_label.winfo_width(), self.screen_label.winfo_height()
-        if win_w == 0 or win_h == 0:
-            return None
-        rel_x, rel_y = (abs_x - win_x) / win_w, (abs_y - win_y) / win_h
-        return (rel_x, rel_y) if 0 <= rel_x <= 1 and 0 <= rel_y <= 1 else None
+        frame = ttk.Frame(self.ui, padding=10)
+        frame.pack(fill="both", expand=True)
 
-    def on_pynput_mouse(self, x, y, button, pressed):
-        coords = self.get_relative_coords(x, y)
-        if coords:
-            self.send_event({'type': 'mouse', 'action': 'click', 'x': coords[0], 'y': coords[1], 'button': button.name, 'pressed': pressed})
+        self.status_label = ttk.Label(frame, text="Server not started", wraplength=380)
+        self.status_label.pack(pady=10)
 
-    def on_pynput_scroll(self, x, y, dx, dy):
-        coords = self.get_relative_coords(x, y)
-        if coords:
-            self.send_event({'type': 'mouse', 'action': 'scroll', 'x': coords[0], 'y': coords[1], 'dx': dx, 'dy': dy})
+        ttk.Button(frame, text="Start Server", command=self.start).pack(pady=5)
+        ttk.Button(frame, text="Stop Server", command=self._on_close).pack(pady=5)
 
-    def send_key_event(self, key, action):
-        if self.root.focus_get() is not self.screen_label:
-            return
-        key_str = key.name if isinstance(key, keyboard.Key) else key.char
-        if key_str:
-            self.send_event({'type': 'keyboard', 'action': action, 'key': key_str})
+        self.ui.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.ui.mainloop()
 
-    def on_close(self):
-        if self.is_connected:
-            self.disconnect()
-        self.root.destroy()
 
 if __name__ == '__main__':
-    root = tk.Tk()
-    app = RemoteDesktopClient(root)
-    root.mainloop()
+    server = RemoteDesktopServer()
+    server.run_ui()
